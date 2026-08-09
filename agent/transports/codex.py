@@ -291,7 +291,14 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_effort = reasoning_config["effort"]
 
         _effort_clamp = {"minimal": "low"}
-        if "gpt-5.6" in (model or "").lower():
+        normalized_model = (model or "").lower()
+        if is_codex_backend and "gpt-5.5" in normalized_model:
+            # ChatGPT's Codex backend rejects max/ultra for gpt-5.5; xhigh is
+            # its strongest accepted wire value. This matters especially when
+            # gpt-5.5 is entered through the fallback chain, where the primary
+            # model's stronger reasoning setting is otherwise inherited.
+            _effort_clamp.update({"max": "xhigh", "ultra": "xhigh"})
+        if "gpt-5.6" in normalized_model:
             # Ultra is the Codex product tier; the Responses API wire value is max.
             _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):

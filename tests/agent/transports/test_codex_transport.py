@@ -39,11 +39,40 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    @pytest.mark.parametrize(
+        ("effort", "expected"),
+        [
+            ("max", "xhigh"),
+            ("ultra", "xhigh"),
+            ("xhigh", "xhigh"),
+            ("high", "high"),
+            ("medium", "medium"),
+            ("low", "low"),
+        ],
+    )
+    def test_codex_gpt55_normalizes_reasoning_to_supported_values(
+        self, transport, effort, expected
+    ):
+        """Clamp unsupported tiers while preserving accepted gpt-5.5 values."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": effort},
+        )
+        assert kw["reasoning"] == {"effort": expected, "summary": "auto"}
 
-
-
-
-
+    def test_non_codex_gpt55_preserves_max_reasoning(self, transport):
+        """Do not clamp API-compatible gpt-5.5 routes by model name alone."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=False,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["reasoning"] == {"effort": "max", "summary": "auto"}
 
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
         """prompt_cache_key is content-addressed from the static prefix
