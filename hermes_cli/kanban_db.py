@@ -11026,8 +11026,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
-         completed runs on other tasks).
+      5. Same-tenant cross-task role history for the assignee (most recent
+         5 completed runs on other tasks). The NULL tenant is its own
+         namespace, not a wildcard.
       6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
@@ -11198,19 +11199,22 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append("")
 
     # Cross-task role history: what else has THIS assignee completed
-    # recently? Gives the worker implicit continuity — "I'm the reviewer
-    # and my last three reviews focused on security" — without forcing
-    # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
-    # most recent 5 completed runs, excluding this task so the retry
+    # recently inside THIS tenant? Gives the worker implicit continuity —
+    # "I'm the reviewer and my last three reviews focused on security" —
+    # without forcing the user to wire anything into SOUL.md / MEMORY.md.
+    # Tenant is an isolation namespace, so neither a named tenant nor the
+    # legacy NULL tenant may inherit another tenant's summaries. Bounded to
+    # the most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
+            "  AND t.tenant IS ? "
             "  AND r.outcome = 'completed' "
             "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
+            (task.assignee, task_id, task.tenant),
         ).fetchall()
         if role_rows:
             lines.append(f"## Recent work by @{task.assignee}")

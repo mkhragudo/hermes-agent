@@ -1420,11 +1420,74 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+def test_worker_context_role_history_is_tenant_scoped(kanban_home):
+    """Implicit role continuity must never cross the tenant boundary."""
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="source case",
+            assignee="reviewer",
+            tenant="case-a",
+        )
+        assert kb.claim_task(conn, source, claimer="test") is not None
+        assert kb.complete_task(
+            conn,
+            source,
+            summary="CROSS_TENANT_PRIVATE_SENTINEL",
+        )
+
+        isolated = kb.create_task(
+            conn,
+            title="isolated case",
+            assignee="reviewer",
+            tenant="case-b",
+        )
+        same_tenant = kb.create_task(
+            conn,
+            title="same-tenant follow-up",
+            assignee="reviewer",
+            tenant="case-a",
+        )
+
+        isolated_context = kb.build_worker_context(conn, isolated)
+        same_tenant_context = kb.build_worker_context(conn, same_tenant)
+
+    assert "CROSS_TENANT_PRIVATE_SENTINEL" not in isolated_context
+    assert "## Recent work by @reviewer" not in isolated_context
+    assert "CROSS_TENANT_PRIVATE_SENTINEL" in same_tenant_context
+    assert "## Recent work by @reviewer" in same_tenant_context
+
+
+def test_worker_context_unscoped_role_history_excludes_named_tenants(kanban_home):
+    """The legacy NULL tenant is its own namespace, not a tenant wildcard."""
+    with kb.connect() as conn:
+        named = kb.create_task(
+            conn,
+            title="named tenant case",
+            assignee="reviewer",
+            tenant="case-a",
+        )
+        assert kb.claim_task(conn, named, claimer="test") is not None
+        assert kb.complete_task(
+            conn,
+            named,
+            summary="NAMED_TENANT_PRIVATE_SENTINEL",
+        )
+
+        unscoped = kb.create_task(
+            conn,
+            title="legacy unscoped case",
+            assignee="reviewer",
+        )
+        context = kb.build_worker_context(conn, unscoped)
+
+    assert "NAMED_TENANT_PRIVATE_SENTINEL" not in context
 
 
 # ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
+
 
 def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     """First scratch workspace materialization warns + emits an event.
