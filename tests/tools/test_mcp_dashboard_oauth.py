@@ -30,6 +30,32 @@ def test_dashboard_flow_exposes_authorization_url_and_accepts_callback():
     assert asyncio.run(flow.wait_for_callback()) == ("code-1", "s1")
 
 
+def test_dashboard_flow_allows_slow_provider_consent(monkeypatch):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-slow-consent",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/flow-slow-consent",
+    )
+    observed_timeouts: list[float] = []
+
+    async def fake_to_thread(_func, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    with pytest.raises(TimeoutError, match="Timed out waiting for MCP OAuth callback"):
+        asyncio.run(flow.wait_for_callback())
+
+    # Cloudflare Access plus provider login can exceed five minutes. Keep the
+    # consent window below the 15-minute dashboard-flow registry TTL, but long
+    # enough for a normal two-stage browser login.
+    assert observed_timeouts == [10 * 60]
+
+
 def test_dashboard_flow_accepts_only_one_concurrent_callback():
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 

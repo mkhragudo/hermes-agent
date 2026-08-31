@@ -18,6 +18,12 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 
+# Dashboard OAuth may require two browser sign-ins (the dashboard access gate
+# and the provider). Keep this below the 15-minute flow-registry TTL while
+# allowing normal human completion time.
+_DEFAULT_CALLBACK_TIMEOUT_SECONDS = 10 * 60
+
+
 @dataclass
 class DashboardOAuthFlow:
     flow_id: str
@@ -83,7 +89,10 @@ class DashboardOAuthFlow:
                 self._callback_error = "OAuth callback did not include code or error"
             self._callback_ready.set()
 
-    async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None]:
+    async def wait_for_callback(
+        self,
+        timeout: float = _DEFAULT_CALLBACK_TIMEOUT_SECONDS,
+    ) -> tuple[str, str | None]:
         ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
         if not ready:
             raise TimeoutError("Timed out waiting for MCP OAuth callback")
