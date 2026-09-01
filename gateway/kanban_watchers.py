@@ -1346,6 +1346,47 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        # Tool-created tasks in this gateway process can wake the existing
+        # dispatcher immediately. The periodic interval remains the durable
+        # cross-process fallback for CLI and worker-process writes. Register
+        # only after singleton ownership is settled so a non-owning gateway
+        # never consumes wake requests.
+        dispatch_wake_event = asyncio.Event()
+        dispatch_wake_token: Optional[int] = None
+        dispatch_socket_receiver = None
+        try:
+            from hermes_cli.kanban_dispatch_signal import (
+                register_cross_process_receiver,
+                register_dispatch_waker,
+                unregister_dispatch_waker,
+            )
+
+            dispatch_wake_token = register_dispatch_waker(
+                asyncio.get_running_loop(), dispatch_wake_event,
+            )
+            dispatch_socket_receiver = register_cross_process_receiver(
+                asyncio.get_running_loop(), dispatch_wake_event,
+            )
+        except Exception:
+            register_dispatch_waker = None  # type: ignore[assignment]
+            unregister_dispatch_waker = None  # type: ignore[assignment]
+            logger.warning(
+                "kanban dispatcher: event wake registration failed; periodic fallback remains",
+                exc_info=True,
+            )
+
+        def _release_dispatch_waker() -> None:
+            nonlocal dispatch_wake_token, dispatch_socket_receiver
+            if dispatch_socket_receiver is not None:
+                dispatch_socket_receiver.close()
+                dispatch_socket_receiver = None
+            if dispatch_wake_token is None or unregister_dispatch_waker is None:
+                return
+            try:
+                unregister_dispatch_waker(dispatch_wake_token)
+            finally:
+                dispatch_wake_token = None
+
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -1482,7 +1523,12 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            _release_dispatch_waker()
+            self._release_kanban_dispatcher_lock()
+            raise
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
@@ -1834,16 +1880,26 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                _release_dispatch_waker()
                 self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
+            # Wait for either a tool-created-task wake or the periodic safety
+            # tick. One-second slices preserve the old shutdown check even on
+            # runners that stop without cancelling this watcher task.
             slept = 0.0
             while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+                step = min(1.0, interval - slept)
+                try:
+                    await asyncio.wait_for(dispatch_wake_event.wait(), timeout=step)
+                except asyncio.TimeoutError:
+                    slept += step
+                    continue
+                dispatch_wake_event.clear()
+                logger.debug("kanban dispatcher: event-driven wake received")
+                break
 
+        _release_dispatch_waker()
         self._release_kanban_dispatcher_lock()

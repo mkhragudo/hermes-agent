@@ -416,6 +416,29 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_requests_immediate_gateway_dispatch_wake(monkeypatch, worker_env):
+    from hermes_cli import kanban_dispatch_signal as dispatch_signal
+    from tools import kanban_tools as kt
+
+    calls = []
+    monkeypatch.setattr(
+        dispatch_signal,
+        "request_dispatch_wake",
+        lambda: calls.append("wake") or 1,
+    )
+
+    out = kt._handle_create({
+        "title": "event-driven child",
+        "assignee": "peer",
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is True
+    assert payload["status"] == "ready"
+    assert payload["dispatch_wake_requested"] is True
+    assert calls == ["wake"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

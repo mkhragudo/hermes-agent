@@ -1464,6 +1464,19 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            # Tool-created work inside the gateway should not wait for the
+            # dispatcher's periodic fallback tick. The process-local signal
+            # preserves every normal dispatcher gate (pause, profile validity,
+            # concurrency, retries) because it wakes the existing watcher
+            # instead of spawning a worker here. CLI/worker subprocesses have
+            # no registered waker and safely fall back to the periodic tick.
+            dispatch_wake_requested = False
+            try:
+                from hermes_cli.kanban_dispatch_signal import request_dispatch_wake
+
+                dispatch_wake_requested = request_dispatch_wake() > 0
+            except Exception:
+                logger.debug("kanban_create dispatch wake failed", exc_info=True)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1471,6 +1484,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                dispatch_wake_requested=dispatch_wake_requested,
             )
         finally:
             conn.close()
