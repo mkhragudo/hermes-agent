@@ -1577,9 +1577,13 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
+        session_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
+        )
+        notifier_profile = (
+            get_session_env("HERMES_SESSION_ADAPTER_PROFILE", "")
+            or session_profile
         )
         if not notifier_profile:
             try:
@@ -1592,6 +1596,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:
             delivery_metadata["chat_type"] = chat_type
+        if session_profile and session_profile != notifier_profile:
+            # One shared bot can route a channel to a secondary runtime brain.
+            # The notifier needs the transport owner to choose credentials and
+            # the runtime profile to resume the correct session.
+            delivery_metadata["session_profile"] = session_profile
         if (
             platform.lower() == "telegram"
             and thread_id

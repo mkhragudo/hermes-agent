@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionContext, SessionSource
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -72,6 +72,40 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     runner._active_profile_name = lambda: "dev"
 
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
+
+
+def test_session_context_tracks_transport_owner_separately(monkeypatch):
+    """A shared adapter route binds runtime and transport profile identities."""
+    from gateway.run import GatewayRunner
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+    )
+
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._adapter_profile_for_source = lambda source: None
+    runner._active_profile_name = lambda: "default"
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="allowed-user",
+        chat_id="ea-chat",
+        user_name="allowed-user",
+        chat_type="group",
+        profile="atlasea",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="ea-session-key",
+    )
+
+    tokens = GatewayRunner._set_session_env(runner, context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "atlasea"
+        assert get_session_env("HERMES_SESSION_ADAPTER_PROFILE") == "default"
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):

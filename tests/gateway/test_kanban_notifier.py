@@ -168,6 +168,50 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_shared_transport_notifies_and_wakes_routed_runtime_profile(
+    tmp_path, monkeypatch,
+):
+    """Transport ownership and runtime wake identity are independent."""
+    db_path = tmp_path / "shared-profile-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="EA routed completion",
+            assignee="worker",
+            session_id="ea-origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="ea-chat",
+            notifier_profile="default",
+            delivery_mode="notify+wake",
+            delivery_metadata={
+                "chat_type": "group",
+                "session_profile": "atlasea",
+            },
+        )
+        kb.complete_task(conn, tid, summary="EA handoff complete")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"atlasea": {}}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "atlasea"
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):

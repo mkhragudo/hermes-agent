@@ -26490,6 +26490,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        try:
+            _adapter_profile = self._adapter_profile_for_source(context.source)
+        except Exception:
+            _adapter_profile = None
+        if not _adapter_profile:
+            try:
+                _adapter_profile = self._active_profile_name() or "default"
+            except Exception:
+                _adapter_profile = "default"
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -26505,6 +26514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            adapter_profile=_adapter_profile,
             async_delivery=_async_delivery,
             cron_session="",
         )

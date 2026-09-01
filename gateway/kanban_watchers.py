@@ -565,6 +565,12 @@ class GatewayKanbanWatchersMixin:
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
+                    _sub_delivery_metadata = sub.get("delivery_metadata")
+                    _wake_profile = (
+                        str(_sub_delivery_metadata.get("session_profile") or "").strip()
+                        if isinstance(_sub_delivery_metadata, dict)
+                        else ""
+                    ) or sub_profile
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -924,7 +930,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                    sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
+                                    sub["task_id"], platform_str, sub["chat_id"], _wake_profile or "default", _wake_kinds,
                                 )
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
@@ -996,7 +1002,7 @@ class GatewayKanbanWatchersMixin:
                                 thread_id=sub.get("thread_id") or None,
                                 user_id=sub.get("user_id"),
                                 user_id_alt=sub.get("user_id_alt"),
-                                profile=sub_profile or None,
+                                profile=_wake_profile or None,
                                 scope_id=_wake_scope_id(adapter, sub),
                             )
                             # deliver_wake preserves the synthetic
@@ -1012,7 +1018,7 @@ class GatewayKanbanWatchersMixin:
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
+                                sub["task_id"], platform_str, sub["chat_id"], _wake_profile or "default", _wake_kinds,
                             )
 
                         if _is_push_adapter and not send_passive and _wake_kinds:

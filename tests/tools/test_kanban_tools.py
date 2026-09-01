@@ -894,6 +894,36 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["delivery_mode"] == "notify+wake"
 
 
+def test_create_separates_shared_transport_owner_from_runtime_profile(
+    monkeypatch, worker_env,
+):
+    """A profile-routed channel keeps the shared bot as notifier owner.
+
+    The runtime profile is persisted separately so notify+wake can resume the
+    routed brain without asking that profile to own a duplicate bot token.
+    """
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "ea-channel")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "atlasea")
+    monkeypatch.setenv("HERMES_SESSION_ADAPTER_PROFILE", "default")
+
+    out = kt._handle_create({
+        "title": "shared profile route",
+        "assignee": "peer",
+    })
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["subscribed"] is True
+
+    subs = _sub_index(_list_subs_for_task(payload["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "default"
+    assert subs[0]["delivery_metadata"]["session_profile"] == "atlasea"
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
