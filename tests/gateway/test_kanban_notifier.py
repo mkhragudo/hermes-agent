@@ -2,6 +2,8 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -24,6 +26,36 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class EaTerminalAdapter(RecordingAdapter):
+    """Simulate the resumed EA accepting, failing, or rejecting a wake."""
+
+    def __init__(self, outcome="accepted"):
+        super().__init__()
+        self.outcome = outcome
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        if self.outcome == "rejected":
+            raise RuntimeError("simulated EA resume rejection")
+
+        delivery = event.metadata["_kanban_terminal_delivery_future"]
+        correlation_key = event.metadata["_kanban_terminal_correlation_key"]
+        accepted = self.outcome == "accepted"
+        if accepted:
+            # This represents the sole founder-facing message produced by the
+            # resumed atlasea turn.  The notifier must not add its raw receipt.
+            self.sent.append({
+                "chat_id": event.source.chat_id,
+                "text": "EA final",
+                "metadata": {},
+            })
+        delivery.set_result({
+            "accepted": accepted,
+            "correlation_key": correlation_key,
+            "reason": None if accepted else "simulated terminal failure",
+        })
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -44,10 +76,10 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     # Most tests model the default gateway after its dispatcher acquired the
     # singleton lock. Tests for startup or non-owner gateways clear this.
@@ -168,13 +200,8 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
-def test_shared_transport_notifies_and_wakes_routed_runtime_profile(
-    tmp_path, monkeypatch,
-):
-    """Transport ownership and runtime wake identity are independent."""
-    db_path = tmp_path / "shared-profile-route.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+def _create_routed_ea_completion():
+    """Create one correlated default-transport → atlasea terminal route."""
     conn = kb.connect()
     try:
         tid = kb.create_task(
@@ -186,7 +213,7 @@ def test_shared_transport_notifies_and_wakes_routed_runtime_profile(
         kb.add_notify_sub(
             conn,
             task_id=tid,
-            platform="telegram",
+            platform="discord",
             chat_id="ea-chat",
             notifier_profile="default",
             delivery_mode="notify+wake",
@@ -196,11 +223,61 @@ def test_shared_transport_notifies_and_wakes_routed_runtime_profile(
             },
         )
         kb.complete_task(conn, tid, summary="EA handoff complete")
+        return tid
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
+
+def _cursor_and_event_head(tid):
+    conn = kb.connect()
+    try:
+        cursor = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        head = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        return cursor, head
+    finally:
+        conn.close()
+
+
+def test_shared_transport_suppresses_raw_after_ea_final_acceptance(
+    tmp_path, monkeypatch,
+):
+    """The resumed EA final is the sole normal founder-facing message."""
+    db_path = tmp_path / "shared-profile-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_routed_ea_completion()
+
+    adapter = EaTerminalAdapter("accepted")
+    runner = _make_runner(adapter, Platform.DISCORD)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"atlasea": {}}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["text"] for item in adapter.sent] == ["EA final"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "atlasea"
+    assert adapter.handled[0].allow_gateway_control is False
+    assert _cursor_and_event_head(tid)[0] == _cursor_and_event_head(tid)[1]
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "failed"])
+def test_shared_transport_emits_one_raw_fallback_when_ea_cannot_finish(
+    tmp_path, monkeypatch, outcome,
+):
+    """Resume rejection or terminal failure yields exactly one raw receipt."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"ea-{outcome}.db"))
+    kb.init_db()
+    tid = _create_routed_ea_completion()
+
+    adapter = EaTerminalAdapter(outcome)
+    runner = _make_runner(adapter, Platform.DISCORD)
     runner._active_profile_name = lambda: "default"
     runner._profile_adapters = {"atlasea": {}}
 
@@ -208,8 +285,41 @@ def test_shared_transport_notifies_and_wakes_routed_runtime_profile(
 
     assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
+    assert "Kanban" in adapter.sent[0]["text"]
     assert len(adapter.handled) == 1
-    assert adapter.handled[0].source.profile == "atlasea"
+    assert _cursor_and_event_head(tid)[0] == _cursor_and_event_head(tid)[1]
+
+
+def test_correlated_ea_replay_keeps_one_total_send_and_one_wake(
+    tmp_path, monkeypatch,
+):
+    """A forced cursor replay is deduped by the stable terminal correlation."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ea-replay.db"))
+    kb.init_db()
+    tid = _create_routed_ea_completion()
+
+    adapter = EaTerminalAdapter("accepted")
+    runner = _make_runner(adapter, Platform.DISCORD)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"atlasea": {}}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = 0 WHERE task_id = ?",
+                (tid,),
+            )
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["text"] for item in adapter.sent] == ["EA final"]
+    assert len(adapter.handled) == 1
+    assert _cursor_and_event_head(tid)[0] == _cursor_and_event_head(tid)[1]
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(

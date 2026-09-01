@@ -117,6 +117,87 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+# Private bridge used only by the correlated Kanban EA terminal route.  The
+# notifier injects an asyncio Future on its synthetic internal event; the
+# gateway resolves it exactly where a final becomes accepted for delivery.
+# No part of this bridge is persisted or accepted from user text.
+_KANBAN_TERMINAL_CORRELATION_METADATA = "_kanban_terminal_correlation_key"
+_KANBAN_TERMINAL_FUTURE_METADATA = "_kanban_terminal_delivery_future"
+_KANBAN_TERMINAL_CORRELATION_ATTR = "_kanban_terminal_correlation_key"
+_KANBAN_TERMINAL_FUTURE_ATTR = "_kanban_terminal_delivery_future"
+
+
+def _bind_kanban_terminal_delivery(source: Any, metadata: Any) -> str:
+    """Bind one internal terminal-delivery Future to the routed source."""
+    if not isinstance(metadata, dict):
+        return ""
+    key = str(metadata.get(_KANBAN_TERMINAL_CORRELATION_METADATA) or "").strip()
+    future = metadata.get(_KANBAN_TERMINAL_FUTURE_METADATA)
+    if not key or future is None or not hasattr(future, "set_result"):
+        return ""
+    setattr(source, _KANBAN_TERMINAL_CORRELATION_ATTR, key)
+    setattr(source, _KANBAN_TERMINAL_FUTURE_ATTR, future)
+    return key
+
+
+def _kanban_terminal_delivery_key(source: Any) -> str:
+    return str(
+        getattr(source, _KANBAN_TERMINAL_CORRELATION_ATTR, "") or ""
+    ).strip()
+
+
+def _clear_kanban_terminal_delivery(source: Any) -> None:
+    for attr in (
+        _KANBAN_TERMINAL_CORRELATION_ATTR,
+        _KANBAN_TERMINAL_FUTURE_ATTR,
+    ):
+        try:
+            delattr(source, attr)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _resolve_kanban_terminal_delivery(
+    source: Any,
+    *,
+    accepted: bool,
+    reason: Optional[str] = None,
+) -> bool:
+    """Resolve a bound terminal-delivery Future once; return whether set."""
+    key = _kanban_terminal_delivery_key(source)
+    future = getattr(source, _KANBAN_TERMINAL_FUTURE_ATTR, None)
+    if not key or future is None:
+        return False
+    try:
+        if future.done():
+            _clear_kanban_terminal_delivery(source)
+            return False
+        future.set_result({
+            "accepted": bool(accepted),
+            "correlation_key": key,
+            "reason": reason,
+        })
+        _clear_kanban_terminal_delivery(source)
+        return True
+    except Exception:
+        return False
+
+
+def _kanban_terminal_delivery_was_rejected(source: Any) -> bool:
+    """Return whether fallback release already won this correlation race."""
+    future = getattr(source, _KANBAN_TERMINAL_FUTURE_ATTR, None)
+    if future is None:
+        return False
+    try:
+        if not future.done():
+            return False
+        result = future.result()
+    except Exception:
+        return True
+    if isinstance(result, dict):
+        return result.get("accepted") is not True
+    return result is not True
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -20474,6 +20555,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         event_metadata = getattr(event, "metadata", None) or {}
+        _bind_kanban_terminal_delivery(source, event_metadata)
         expected_session_key = str(
             event_metadata.get("gateway_session_key") or ""
         ).strip()
@@ -22247,6 +22329,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                _resolve_kanban_terminal_delivery(
+                    source,
+                    accepted=False,
+                    reason="stale gateway run generation",
+                )
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -22774,6 +22861,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # Correlated EA terminals have exactly two mutually exclusive
+            # founder-facing outcomes: a successful resumed EA final, or the
+            # notifier's one raw fallback.  A failed/empty/silent turn is not a
+            # final accepted for delivery, so resolve the fallback gate and
+            # suppress the gateway's competing generic error response.
+            _kanban_terminal_key = _kanban_terminal_delivery_key(source)
+            _kanban_terminal_final_accepted = False
+            if _kanban_terminal_key:
+                _kanban_terminal_already_rejected = (
+                    _kanban_terminal_delivery_was_rejected(source)
+                )
+                _raw_terminal_final = str(
+                    agent_result.get("final_response") or ""
+                ).strip()
+                _kanban_terminal_final_accepted = bool(
+                    not _kanban_terminal_already_rejected
+                    and not agent_result.get("failed")
+                    and not _intentional_silence
+                    and _raw_terminal_final
+                    and _raw_terminal_final != "(empty)"
+                    and response
+                )
+                if not _kanban_terminal_final_accepted:
+                    _resolve_kanban_terminal_delivery(
+                        source,
+                        accepted=False,
+                        reason=(
+                            "raw fallback already released"
+                            if _kanban_terminal_already_rejected
+                            else ""
+                        ) or (
+                            str(agent_result.get("failure_reason") or "").strip()
+                            or str(agent_result.get("error") or "").strip()
+                            or "EA turn produced no deliverable final"
+                        ),
+                    )
+                    response = ""
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -22829,8 +22954,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event._streamed_final_response = str(response or "")
                 except Exception:
                     pass
+                if _kanban_terminal_key and _kanban_terminal_final_accepted:
+                    _resolve_kanban_terminal_delivery(
+                        source,
+                        accepted=True,
+                        reason="EA final already delivered by stream",
+                    )
                 return None
 
+            if _kanban_terminal_key and _kanban_terminal_final_accepted:
+                _resolve_kanban_terminal_delivery(
+                    source,
+                    accepted=True,
+                    reason="EA final accepted for normal delivery",
+                )
             return response
             
         except Exception as e:
@@ -22854,6 +22991,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            _kanban_terminal_exception = bool(
+                _kanban_terminal_delivery_key(source)
+            )
+            if _kanban_terminal_exception:
+                _resolve_kanban_terminal_delivery(
+                    source,
+                    accepted=False,
+                    reason=f"EA gateway exception: {type(e).__name__}",
+                )
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -22900,6 +23046,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+            if _kanban_terminal_exception:
+                # The notifier now owns the sole raw fallback.  Returning the
+                # generic gateway error here would create a second founder-facing
+                # message for the same terminal correlation.
+                return ""
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
             status_hint = ""
@@ -22949,6 +23100,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _kanban_terminal_delivery_key(source):
+                _resolve_kanban_terminal_delivery(
+                    source,
+                    accepted=False,
+                    reason="EA gateway turn exited before final acceptance",
+                )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -31975,18 +32132,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # ahead. Log the decision inputs so a recurrence can be pinned to
                 # "signal never set" vs "ack-pending race".
                 # See docs/rca-wecom-stream-final-ack-timeout-duplicate.md.
-                logger.warning(
-                    "Normal final-send NOT suppressed despite active stream "
-                    "consumer for session %s: streamed=%s previewed=%s "
-                    "content_delivered=%s transformed=%s final_len=%d — "
-                    "possible duplicate send (see wecom ack-timeout RCA).",
-                    session_key or "?",
-                    _streamed,
-                    _previewed,
-                    _content_delivered,
-                    _transformed,
-                    len(_final),
-                )
+                if _kanban_terminal_delivery_key(source):
+                    # For the correlated EA terminal route the normal final is
+                    # canonical: the raw Kanban receipt is deferred in the
+                    # notifier and suppressed only after this final is accepted.
+                    # Do not apply stream-presence suppression here.
+                    logger.info(
+                        "Normal final-send retained for correlated EA terminal "
+                        "session %s: streamed=%s previewed=%s "
+                        "content_delivered=%s transformed=%s final_len=%d.",
+                        session_key or "?",
+                        _streamed,
+                        _previewed,
+                        _content_delivered,
+                        _transformed,
+                        len(_final),
+                    )
+                else:
+                    logger.warning(
+                        "Normal final-send NOT suppressed despite active stream "
+                        "consumer for session %s: streamed=%s previewed=%s "
+                        "content_delivered=%s transformed=%s final_len=%d — "
+                        "possible duplicate send (see wecom ack-timeout RCA).",
+                        session_key or "?",
+                        _streamed,
+                        _previewed,
+                        _content_delivered,
+                        _transformed,
+                        len(_final),
+                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

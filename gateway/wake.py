@@ -59,13 +59,15 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. ``metadata`` carries private in-process correlation
+    state on that synthetic event; it is not used by non-push self-posts.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -82,6 +84,11 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=dict(metadata or {}),
+            # Correlated terminal wakes are pure internal work items.  Marking
+            # them control-ineligible makes a busy session use the existing
+            # FIFO path instead of text-merging away a distinct Future/key.
+            allow_gateway_control=not bool(metadata),
         )
         await adapter.handle_message(synth_event)
         return

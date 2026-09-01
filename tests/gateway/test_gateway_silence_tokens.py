@@ -1,5 +1,6 @@
-"""Gateway intentional-silence token behavior."""
+"""Gateway intentional-silence and correlated-final behavior."""
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,20 +16,23 @@ from gateway.response_filters import (
 )
 
 
-def _source():
+def _source(*, profile=None):
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
         chat_type="group",
         user_id="12345",
+        profile=profile,
     )
 
 
-def _event():
+def _event(*, source=None, metadata=None, internal=False):
     return MessageEvent(
         text="side chatter",
-        source=_source(),
+        source=source or _source(),
         message_id="msg-42",
+        metadata=metadata or {},
+        internal=internal,
     )
 
 
@@ -163,6 +167,144 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     )
 
     assert response == text
+
+
+@pytest.mark.asyncio
+async def test_correlated_ea_final_is_accepted_for_delivery(monkeypatch, tmp_path):
+    """A successful resumed EA result releases raw-receipt suppression."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "EA contextual final",
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+    delivery = asyncio.get_running_loop().create_future()
+    source = _source(profile="atlasea")
+    event = _event(
+        source=source,
+        internal=True,
+        metadata={
+            "_kanban_terminal_correlation_key": "default:t_ea:42",
+            "_kanban_terminal_delivery_future": delivery,
+        },
+    )
+
+    response = await runner._handle_message_with_agent(
+        event, source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == "EA contextual final"
+    assert delivery.result()["accepted"] is True
+    assert delivery.result()["correlation_key"] == "default:t_ea:42"
+    assert not hasattr(source, "_kanban_terminal_delivery_future")
+    assert not hasattr(source, "_kanban_terminal_correlation_key")
+
+
+@pytest.mark.asyncio
+async def test_correlated_ea_terminal_failure_defers_to_raw_fallback(
+    monkeypatch, tmp_path,
+):
+    """A failed resumed turn emits no competing gateway error final."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "provider failed",
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": True,
+        "error": "provider failed",
+    })
+    delivery = asyncio.get_running_loop().create_future()
+    source = _source(profile="atlasea")
+    event = _event(
+        source=source,
+        internal=True,
+        metadata={
+            "_kanban_terminal_correlation_key": "default:t_ea:43",
+            "_kanban_terminal_delivery_future": delivery,
+        },
+    )
+
+    response = await runner._handle_message_with_agent(
+        event, source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+    assert delivery.result()["accepted"] is False
+    assert delivery.result()["correlation_key"] == "default:t_ea:43"
+
+
+@pytest.mark.asyncio
+async def test_correlated_ea_late_final_stays_suppressed_after_fallback_release(
+    monkeypatch, tmp_path,
+):
+    """A timeout/rejection decision wins over a final that becomes ready later."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "late EA final",
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+    delivery = asyncio.get_running_loop().create_future()
+    delivery.set_result({
+        "accepted": False,
+        "correlation_key": "default:t_ea:44",
+        "reason": "bounded final-acceptance timeout",
+    })
+    source = _source(profile="atlasea")
+    event = _event(
+        source=source,
+        internal=True,
+        metadata={
+            "_kanban_terminal_correlation_key": "default:t_ea:44",
+            "_kanban_terminal_delivery_future": delivery,
+        },
+    )
+
+    response = await runner._handle_message_with_agent(
+        event, source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+    assert delivery.result()["accepted"] is False
+
+
+@pytest.mark.asyncio
+async def test_correlated_ea_cancelled_turn_releases_fallback_immediately(
+    monkeypatch, tmp_path,
+):
+    """Cancellation is terminal failure, not a ten-minute pending future."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=asyncio.CancelledError())
+    delivery = asyncio.get_running_loop().create_future()
+    source = _source(profile="atlasea")
+    event = _event(
+        source=source,
+        internal=True,
+        metadata={
+            "_kanban_terminal_correlation_key": "default:t_ea:45",
+            "_kanban_terminal_delivery_future": delivery,
+        },
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_message_with_agent(
+            event, source, "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    assert delivery.done()
+    assert delivery.result()["accepted"] is False
+    assert not hasattr(source, "_kanban_terminal_delivery_future")
 
 
 @pytest.mark.asyncio

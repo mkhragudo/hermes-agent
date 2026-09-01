@@ -27,6 +27,58 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+# Canonical founder-facing EA terminal route.  This is deliberately narrow:
+# the shared ``default`` Discord transport owns the subscription while the
+# synthetic turn resumes the isolated ``atlasea`` runtime profile.
+_EA_TERMINAL_PLATFORM = "discord"
+_EA_TERMINAL_NOTIFIER_PROFILE = "default"
+_EA_TERMINAL_SESSION_PROFILE = "atlasea"
+_EA_TERMINAL_FINAL_TIMEOUT_SECONDS = 600.0
+_EA_TERMINAL_STATE_LIMIT = 2048
+
+_KANBAN_WAKE_KINDS = (
+    "completed", "gave_up", "crashed", "timed_out", "blocked",
+    "review_requested", "changes_requested", "block_loop_detected",
+)
+
+
+def _is_correlated_ea_terminal_route(
+    *,
+    platform: str,
+    mode: str,
+    notifier_profile: str,
+    session_profile: str,
+) -> bool:
+    """Return whether this subscription uses the one-message EA policy."""
+    return (
+        platform == _EA_TERMINAL_PLATFORM
+        and mode == "notify+wake"
+        and notifier_profile == _EA_TERMINAL_NOTIFIER_PROFILE
+        and session_profile == _EA_TERMINAL_SESSION_PROFILE
+    )
+
+
+def _ea_terminal_correlation_key(
+    board: Optional[str], sub: dict, event_id: int,
+) -> str:
+    """Stable retry/replay key for one terminal event and destination."""
+    return ":".join((
+        str(board or "default"),
+        str(sub.get("task_id") or ""),
+        str(event_id),
+        str(sub.get("platform") or "").lower(),
+        str(sub.get("chat_id") or ""),
+        str(sub.get("thread_id") or ""),
+    ))
+
+
+def _ea_terminal_delivery_accepted(result: Any) -> bool:
+    """Interpret the gateway's correlated final-acceptance result."""
+    if isinstance(result, dict):
+        return result.get("accepted") is True
+    return result is True
+
+
 _LOCAL_PATH_RE = re.compile(
     r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
     r"[A-Za-z]:\\[^\s,;]+)"
@@ -293,6 +345,18 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Process-local replay ledger for the bounded EA one-message route.
+        # The durable notifier cursor remains the primary dedup mechanism; this
+        # ledger closes same-process rewinds/replays without adding a database or
+        # schema.  Completed entries are retained up to a hard bound.
+        ea_delivery_states: dict[str, str] = getattr(
+            self, "_kanban_ea_terminal_delivery_states", {}
+        )
+        self._kanban_ea_terminal_delivery_states = ea_delivery_states
+        ea_delivery_tasks: set[asyncio.Task] = getattr(
+            self, "_kanban_ea_terminal_delivery_tasks", set()
+        )
+        self._kanban_ea_terminal_delivery_tasks = ea_delivery_tasks
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -571,6 +635,13 @@ class GatewayKanbanWatchersMixin:
                         if isinstance(_sub_delivery_metadata, dict)
                         else ""
                     ) or sub_profile
+                    _ea_correlated_route = _is_correlated_ea_terminal_route(
+                        platform=platform_str,
+                        mode=mode,
+                        notifier_profile=str(sub_profile or "").strip(),
+                        session_profile=_wake_profile,
+                    )
+                    _ea_fallback_payload: Optional[dict[str, Any]] = None
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -711,6 +782,25 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+
+                        if _ea_correlated_route and kind in _KANBAN_WAKE_KINDS:
+                            # Defer this one raw receipt until the correlated EA
+                            # wake either produces a final accepted for delivery
+                            # or reaches a bounded rejection/failure.  Keep only
+                            # the newest wake-worthy event in a multi-event claim;
+                            # that event is the stable correlation unit.
+                            if (
+                                _ea_fallback_payload is None
+                                or int(ev.id) > int(_ea_fallback_payload["event_id"])
+                            ):
+                                _ea_fallback_payload = {
+                                    "event": ev,
+                                    "event_id": int(ev.id),
+                                    "message": msg,
+                                    "metadata": metadata,
+                                }
+                            continue
+
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -838,20 +928,13 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         # Kinds that hand a decision back to the origin, so the
-                        # origin has to take a turn. ``review_requested`` (the
-                        # implementation is done and waits for a reviewer),
-                        # ``changes_requested`` (a reviewer BLOCKed and work
-                        # returns to the implementer) and ``block_loop_detected``
-                        # (routed to triage) belong here for the same reason
-                        # ``blocked`` does. ``status`` / ``archived`` /
+                        # origin has to take a turn. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {
+                                ev.kind for ev in d["events"]
+                                if ev.kind in _KANBAN_WAKE_KINDS
+                            }
                             if wake_agent
                             else set()
                         )
@@ -860,6 +943,14 @@ class GatewayKanbanWatchersMixin:
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
+                        _ea_delivery_future: Optional[asyncio.Future] = None
+                        _ea_correlation_key = ""
+                        if _ea_correlated_route and _ea_fallback_payload is not None:
+                            _ea_correlation_key = _ea_terminal_correlation_key(
+                                board_slug,
+                                sub,
+                                _ea_fallback_payload["event_id"],
+                            )
                         if _wake_kinds:
                             if _is_push_adapter:
                                 _session_key = getattr(task, "session_id", None) or ""
@@ -1010,16 +1101,274 @@ class GatewayKanbanWatchersMixin:
                             # push-capable adapters (the non-push /
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
+                            _wake_metadata = None
+                            if _ea_delivery_future is not None and _ea_correlation_key:
+                                _wake_metadata = {
+                                    "_kanban_terminal_correlation_key": _ea_correlation_key,
+                                    "_kanban_terminal_delivery_future": _ea_delivery_future,
+                                }
                             await deliver_wake(
                                 adapter,
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
+                                metadata=_wake_metadata,
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                 sub["task_id"], platform_str, sub["chat_id"], _wake_profile or "default", _wake_kinds,
                             )
+
+                        if (
+                            _ea_correlated_route
+                            and _is_push_adapter
+                            and _wake_kinds
+                            and _ea_fallback_payload is not None
+                            and _ea_correlation_key
+                        ):
+                            _ea_fallback_message = str(
+                                _ea_fallback_payload["message"]
+                            )
+                            _ea_fallback_metadata = dict(
+                                _ea_fallback_payload["metadata"]
+                            )
+                            _ea_ctx = {
+                                "key": _ea_correlation_key,
+                                "task_id": str(sub["task_id"]),
+                                "sub": dict(sub),
+                                "sub_key": sub_key,
+                                "adapter": adapter,
+                                "message": _ea_fallback_message,
+                                "metadata": _ea_fallback_metadata,
+                                "cursor": int(d["cursor"]),
+                                "old_cursor": int(d.get("old_cursor", 0)),
+                                "board": board_slug,
+                                "task_terminal": bool(task_terminal),
+                            }
+
+                            async def _send_ea_raw_fallback(
+                                _ctx: dict[str, Any] = _ea_ctx,
+                            ) -> bool:
+                                """Send the deferred raw receipt at most once."""
+                                _key = _ctx["key"]
+                                _sub = _ctx["sub"]
+                                _sub_key = _ctx["sub_key"]
+                                state = ea_delivery_states.get(_key)
+                                if state in {"accepted", "fallback"}:
+                                    return True
+                                if state == "fallback_sending":
+                                    return False
+                                ea_delivery_states[_key] = "fallback_sending"
+                                try:
+                                    _fallback_res = await _ctx["adapter"].send(
+                                        _sub["chat_id"],
+                                        _ctx["message"],
+                                        metadata=_ctx["metadata"],
+                                    )
+                                    if getattr(_fallback_res, "success", True) is False:
+                                        raise RuntimeError(
+                                            "adapter send() reported failure: "
+                                            f"{getattr(_fallback_res, 'error', None) or 'unknown error'}"
+                                        )
+                                except Exception as _fallback_err:
+                                    ea_delivery_states[_key] = "fallback_retry"
+                                    fails = sub_fail_counts.get(_sub_key, 0) + 1
+                                    sub_fail_counts[_sub_key] = fails
+                                    logger.warning(
+                                        "kanban notifier: correlated EA raw fallback failed "
+                                        "for %s key=%s (attempt %d/%d): %s",
+                                        _ctx["task_id"], _key,
+                                        fails, MAX_SEND_FAILURES, _fallback_err,
+                                    )
+                                    if fails >= MAX_SEND_FAILURES:
+                                        logger.warning(
+                                            "kanban notifier: dropping correlated EA "
+                                            "subscription %s after %d fallback failures",
+                                            _ctx["task_id"], fails,
+                                        )
+                                        await _to_thread_process_service(
+                                            self._kanban_unsub,
+                                            _sub,
+                                            _ctx["board"],
+                                        )
+                                        ea_delivery_states[_key] = (
+                                            "fallback_exhausted"
+                                        )
+                                        sub_fail_counts.pop(_sub_key, None)
+                                    else:
+                                        await _to_thread_process_service(
+                                            self._kanban_rewind,
+                                            _sub,
+                                            _ctx["cursor"],
+                                            _ctx["old_cursor"],
+                                            _ctx["board"],
+                                        )
+                                    return False
+
+                                ea_delivery_states[_key] = "fallback"
+                                sub_fail_counts.pop(_sub_key, None)
+                                await _to_thread_process_service(
+                                    self._kanban_advance,
+                                    _sub,
+                                    _ctx["cursor"],
+                                    _ctx["board"],
+                                )
+                                if _ctx["task_terminal"]:
+                                    await _to_thread_process_service(
+                                        self._kanban_unsub,
+                                        _sub,
+                                        _ctx["board"],
+                                    )
+                                logger.info(
+                                    "kanban notifier: emitted correlated EA raw "
+                                    "fallback for %s key=%s",
+                                    _ctx["task_id"], _key,
+                                )
+                                return True
+
+                            async def _finish_ea_terminal_delivery(
+                                delivery_future: asyncio.Future,
+                                _ctx: dict[str, Any] = _ea_ctx,
+                                _fallback_sender: Callable[[], Any] = (
+                                    _send_ea_raw_fallback
+                                ),
+                            ) -> None:
+                                """Await EA final acceptance, else release fallback."""
+                                _key = _ctx["key"]
+                                try:
+                                    if delivery_future.done():
+                                        _delivery_result = delivery_future.result()
+                                    else:
+                                        _delivery_result = await asyncio.wait_for(
+                                            asyncio.shield(delivery_future),
+                                            timeout=_EA_TERMINAL_FINAL_TIMEOUT_SECONDS,
+                                        )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as _delivery_err:
+                                    if not delivery_future.done():
+                                        delivery_future.set_result({
+                                            "accepted": False,
+                                            "correlation_key": _key,
+                                            "reason": str(_delivery_err),
+                                        })
+                                    _delivery_result = {
+                                        "accepted": False,
+                                        "correlation_key": _key,
+                                        "reason": str(_delivery_err),
+                                    }
+
+                                if _ea_terminal_delivery_accepted(_delivery_result):
+                                    ea_delivery_states[_key] = "accepted"
+                                    sub_fail_counts.pop(_ctx["sub_key"], None)
+                                    if _ctx["task_terminal"]:
+                                        await _to_thread_process_service(
+                                            self._kanban_unsub,
+                                            _ctx["sub"],
+                                            _ctx["board"],
+                                        )
+                                    logger.info(
+                                        "kanban notifier: correlated EA final accepted "
+                                        "for %s key=%s; raw receipt suppressed",
+                                        _ctx["task_id"], _key,
+                                    )
+                                    return
+
+                                logger.warning(
+                                    "kanban notifier: correlated EA final rejected/failed "
+                                    "for %s key=%s; releasing one raw fallback",
+                                    _ctx["task_id"], _key,
+                                )
+                                await _fallback_sender()
+
+                            _prior_ea_state = ea_delivery_states.get(
+                                _ea_correlation_key
+                            )
+                            if _prior_ea_state == "fallback_retry":
+                                await _send_ea_raw_fallback()
+                                continue
+                            if _prior_ea_state is not None:
+                                # The durable cursor normally makes this path
+                                # unreachable.  Retain a process-local key so a
+                                # rewind/replay cannot wake or send twice.
+                                logger.info(
+                                    "kanban notifier: deduped correlated EA replay "
+                                    "for %s key=%s state=%s",
+                                    sub["task_id"], _ea_correlation_key,
+                                    _prior_ea_state,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_advance,
+                                    sub,
+                                    d["cursor"],
+                                    board_slug,
+                                )
+                                if (
+                                    task_terminal
+                                    and _prior_ea_state
+                                    in {"accepted", "fallback", "fallback_exhausted"}
+                                ):
+                                    await _to_thread_process_service(
+                                        self._kanban_unsub, sub, board_slug,
+                                    )
+                                continue
+
+                            _ea_delivery_future = (
+                                asyncio.get_running_loop().create_future()
+                            )
+                            ea_delivery_states[_ea_correlation_key] = "pending"
+                            if len(ea_delivery_states) > _EA_TERMINAL_STATE_LIMIT:
+                                for _old_key, _old_state in list(
+                                    ea_delivery_states.items()
+                                ):
+                                    if len(ea_delivery_states) <= (
+                                        _EA_TERMINAL_STATE_LIMIT // 2
+                                    ):
+                                        break
+                                    if (
+                                        _old_key != _ea_correlation_key
+                                        and _old_state != "pending"
+                                    ):
+                                        ea_delivery_states.pop(_old_key, None)
+
+                            try:
+                                # Resume acceptance precedes both cursor
+                                # confirmation and raw-receipt suppression.
+                                await _push_wake()
+                            except Exception as _ea_wake_err:
+                                if not _ea_delivery_future.done():
+                                    _ea_delivery_future.set_result({
+                                        "accepted": False,
+                                        "correlation_key": _ea_correlation_key,
+                                        "reason": str(_ea_wake_err),
+                                    })
+                                await _finish_ea_terminal_delivery(
+                                    _ea_delivery_future
+                                )
+                                continue
+
+                            await _to_thread_process_service(
+                                self._kanban_advance,
+                                sub,
+                                d["cursor"],
+                                board_slug,
+                            )
+
+                            if _ea_delivery_future.done():
+                                await _finish_ea_terminal_delivery(
+                                    _ea_delivery_future
+                                )
+                            else:
+                                _ea_task = asyncio.create_task(
+                                    _finish_ea_terminal_delivery(
+                                        _ea_delivery_future
+                                    )
+                                )
+                                ea_delivery_tasks.add(_ea_task)
+                                _ea_task.add_done_callback(
+                                    ea_delivery_tasks.discard
+                                )
+                            continue
 
                         if _is_push_adapter and not send_passive and _wake_kinds:
                             # Wake-only (delivery_mode='wake') push sub: the
