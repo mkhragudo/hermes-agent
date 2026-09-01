@@ -1367,6 +1367,14 @@ class GatewayKanbanWatchersMixin:
             dispatch_socket_receiver = register_cross_process_receiver(
                 asyncio.get_running_loop(), dispatch_wake_event,
             )
+            logger.info(
+                "kanban dispatcher: event-driven wake enabled (in-process%s)",
+                (
+                    f" + {dispatch_socket_receiver.path}"
+                    if dispatch_socket_receiver is not None
+                    else ""
+                ),
+            )
         except Exception:
             register_dispatch_waker = None  # type: ignore[assignment]
             unregister_dispatch_waker = None  # type: ignore[assignment]
